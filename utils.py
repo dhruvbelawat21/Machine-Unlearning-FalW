@@ -1,447 +1,325 @@
-"""
-    setup model and datasets
-"""
-
-
 import copy
-import os
-import random
 
-# from advertorch.utils import NormalizeByChannelMeanStd
-import shutil
-import sys
-import time
-
-import numpy as np
 import torch
-from dataset import *
-from dataset import TinyImageNet
-from imagenet import prepare_data
-from models import *
-from torchvision import transforms
+import torch.nn as nn
+import torch.nn.utils.prune as prune
+from torch.autograd import grad
+from torch.nn import Conv2d
 
 __all__ = [
-    "setup_model_dataset",
-    "AverageMeter",
-    "warmup_lr",
-    "save_checkpoint",
-    "setup_seed",
-    "accuracy",
+    "pruning_model",
+    "pruning_model_random",
+    "prune_model_custom",
+    "remove_prune",
+    "extract_mask",
+    "reverse_mask",
+    "check_sparsity",
+    "check_sparsity_dict",
+    "global_prune_model",
 ]
 
 
-def warmup_lr(epoch, step, optimizer, one_epoch_step, args):
-    overall_steps = args.warmup * one_epoch_step
-    current_steps = epoch * one_epoch_step + step
+# Pruning operation
+def pruning_model(model, px):
+    print("Apply Unstructured L1 Pruning Globally (all conv layers)")
+    parameters_to_prune = []
+    for name, m in model.named_modules():
+        if isinstance(m, nn.Conv2d):
+            parameters_to_prune.append((m, "weight"))
 
-    lr = args.lr * current_steps / overall_steps
-    lr = min(lr, args.lr)
-
-    for p in optimizer.param_groups:
-        p["lr"] = lr
-
-
-def save_checkpoint(
-    state, is_SA_best, save_path, pruning, filename="checkpoint.pth.tar"
-):
-    filepath = os.path.join(save_path, str(pruning) + filename)
-    torch.save(state, filepath)
-    if is_SA_best:
-        shutil.copyfile(
-            filepath, os.path.join(save_path, str(pruning) + "model_SA_best.pth.tar")
-        )
-
-
-def load_checkpoint(device, save_path, pruning, filename="checkpoint.pth.tar"):
-    filepath = os.path.join(save_path, str(pruning) + filename)
-    if os.path.exists(filepath):
-        print("Load checkpoint from:{}".format(filepath))
-        return torch.load(filepath, device)
-    print("Checkpoint not found! path:{}".format(filepath))
-    return None
-
-
-class AverageMeter(object):
-    """Computes and stores the average and current value"""
-
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
-
-
-def dataset_convert_to_train(dataset):
-    train_transform = transforms.Compose(
-        [
-            transforms.RandomCrop(32, padding=4),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-        ]
+    parameters_to_prune = tuple(parameters_to_prune)
+    prune.global_unstructured(
+        parameters_to_prune,
+        pruning_method=prune.L1Unstructured,
+        amount=px,
     )
-    while hasattr(dataset, "dataset"):
-        dataset = dataset.dataset
-    dataset.transform = train_transform
-    dataset.train = False
 
 
-def dataset_convert_to_test(dataset, args=None):
-    if args.dataset == "TinyImagenet":
-        test_transform = transforms.Compose([])
-    else:
-        test_transform = transforms.Compose(
-            [
-                transforms.ToTensor(),
-            ]
-        )
-    while hasattr(dataset, "dataset"):
-        dataset = dataset.dataset
-    dataset.transform = test_transform
-    dataset.train = False
-
-
-def calculate_dataset_distribution(loader, args):
-    """
-    计算数据集中每个类别的样本数
-
-    参数:
-        loader: 数据加载器
-        class_num: 类别总数
-
-    返回:
-        一个长度为class_num的数组，表示每个类别的样本数
-    """
-    counts =  torch.zeros(args.num_classes).to(f"cuda:{args.gpu}")
-    for i, (image, target) in enumerate(loader):
-        target = target.to(f"cuda:{args.gpu}")
-        counts += torch.bincount(target, minlength=args.num_classes)
-        
-    return counts.cpu().numpy()
-
-
-
-def setup_model_dataset(args):
-    if args.dataset == "cifar10":
-        classes = 10
-        args.num_classes = classes
-        normalization = NormalizeByChannelMeanStd(
-            mean=[0.4914, 0.4822, 0.4465], std=[0.2470, 0.2435, 0.2616]
-        )
-        train_full_loader, val_loader, _ = cifar10_dataloaders(
-            batch_size=args.batch_size, data_dir=args.data, num_workers=args.workers
-        )
-        marked_loader, _, test_loader = cifar10_dataloaders(
-            batch_size=args.batch_size,
-            data_dir=args.data,
-            num_workers=args.workers,
-            class_to_replace=args.class_to_replace,
-            num_indexes_to_replace=args.num_indexes_to_replace,
-            indexes_to_replace=args.indexes_to_replace,
-            sample_forget_type = args.sample_forget_type,
-            seed=args.seed,
-            only_mark=True,
-            shuffle=True,
-            no_aug=args.no_aug,
-        )
-
-        if args.train_seed is None:
-            args.train_seed = args.seed
-        setup_seed(args.train_seed)
-
-        if args.imagenet_arch:
-            model = model_dict[args.arch](num_classes=classes, imagenet=True)
-        else:
-            model = model_dict[args.arch](num_classes=classes)
-
-        setup_seed(args.train_seed)
-
-        model.normalize = normalization
-        return model, train_full_loader, val_loader, test_loader, marked_loader
-    elif args.dataset == "svhn":
-        classes = 10
-        normalization = NormalizeByChannelMeanStd(
-            mean=[0.4377, 0.4438, 0.4728], std=[0.1201, 0.1231, 0.1052]
-        )
-        train_full_loader, val_loader, _ = svhn_dataloaders(
-            batch_size=args.batch_size, data_dir=args.data, num_workers=args.workers
-        )
-        marked_loader, _, test_loader = svhn_dataloaders(
-            batch_size=args.batch_size,
-            data_dir=args.data,
-            num_workers=args.workers,
-            class_to_replace=args.class_to_replace,
-            num_indexes_to_replace=args.num_indexes_to_replace,
-            indexes_to_replace=args.indexes_to_replace,
-            seed=args.seed,
-            only_mark=True,
-            shuffle=True,
-        )
-        if args.imagenet_arch:
-            model = model_dict[args.arch](num_classes=classes, imagenet=True)
-        else:
-            model = model_dict[args.arch](num_classes=classes)
-
-        model.normalize = normalization
-        return model, train_full_loader, val_loader, test_loader, marked_loader
-    elif args.dataset == "cifar100":
-        classes = 100
-        args.num_classes = classes
-        normalization = NormalizeByChannelMeanStd(
-            mean=[0.5071, 0.4866, 0.4409], std=[0.2673, 0.2564, 0.2762]
-        )
-        train_full_loader, val_loader, _ = cifar100_dataloaders(
-            batch_size=args.batch_size, data_dir=args.data, num_workers=args.workers
-        )
-        marked_loader, _, test_loader = cifar100_dataloaders(
-            batch_size=args.batch_size,
-            data_dir=args.data,
-            num_workers=args.workers,
-            class_to_replace=args.class_to_replace,
-            num_indexes_to_replace=args.num_indexes_to_replace,
-            indexes_to_replace=args.indexes_to_replace,
-            sample_forget_type = args.sample_forget_type,
-            seed=args.seed,
-            only_mark=True,
-            shuffle=True,
-            no_aug=args.no_aug,
-        )
-        if args.imagenet_arch:
-            model = model_dict[args.arch](num_classes=classes, imagenet=True)
-        else:
-            model = model_dict[args.arch](num_classes=classes)
-        model.normalize = normalization
-        return model, train_full_loader, val_loader, test_loader, marked_loader
-    elif args.dataset == "TinyImagenet":
-        classes = 200
-        args.num_classes = classes
-        normalization = NormalizeByChannelMeanStd(
-            mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-        )
-        train_full_loader, val_loader, test_loader = TinyImageNet(args).data_loaders(
-            batch_size=args.batch_size, data_dir=args.data, num_workers=args.workers
-        )
-        # train_full_loader, val_loader, test_loader =None, None,None
-        marked_loader, _, _ = TinyImageNet(args).data_loaders(
-            batch_size=args.batch_size,
-            data_dir=args.data,
-            num_workers=args.workers,
-            class_to_replace=args.class_to_replace,
-            num_indexes_to_replace=args.num_indexes_to_replace,
-            indexes_to_replace=args.indexes_to_replace,
-            sample_forget_type = args.sample_forget_type,
-            seed=args.seed,
-            only_mark=True,
-            shuffle=True,
-        )
-        if args.imagenet_arch:
-            model = model_dict[args.arch](num_classes=classes, imagenet=True)
-        else:
-            model = model_dict[args.arch](num_classes=classes)
-
-        model.normalize = normalization
-        return model, train_full_loader, val_loader, test_loader, marked_loader
-
-    elif args.dataset == "imagenet":
-        classes = 1000
-        args.num_classes = classes
-        normalization = NormalizeByChannelMeanStd(
-            mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-        )
-        train_ys = torch.load(args.train_y_file)
-        val_ys = torch.load(args.val_y_file)
-        model = model_dict[args.arch](num_classes=classes, imagenet=True)
-
-        model.normalize = normalization
-        if args.class_to_replace is None:
-            loaders = prepare_data(dataset="imagenet", batch_size=args.batch_size)
-            train_loader, val_loader = loaders["train"], loaders["val"]
-            return model, train_loader, val_loader
-        else:
-            train_subset_indices = torch.ones_like(train_ys)
-            val_subset_indices = torch.ones_like(val_ys)
-            train_subset_indices[train_ys == args.class_to_replace] = 0
-            val_subset_indices[val_ys == args.class_to_replace] = 0
-            loaders = prepare_data(
-                dataset="imagenet",
-                batch_size=args.batch_size,
-                train_subset_indices=train_subset_indices,
-                val_subset_indices=val_subset_indices,
+def pruning_model_structured(model, px):
+    print("Apply Unstructured L1 Pruning Globally (all conv layers)")
+    # parameters_to_prune =[]
+    for name, m in model.named_modules():
+        if isinstance(m, nn.Conv2d):
+            prune.ln_structured(
+                m,
+                name="weight",
+                amount=px,
+                dim=0,
+                n=1,  # l1 loss
             )
-            retain_loader = loaders["train"]
-            forget_loader = loaders["fog"]
-            val_loader = loaders["val"]
-            return model, retain_loader, forget_loader, val_loader
 
-    elif args.dataset == "cifar100_no_val":
-        classes = 100
-        args.num_classes = classes
-        normalization = NormalizeByChannelMeanStd(
-            mean=[0.5071, 0.4866, 0.4409], std=[0.2673, 0.2564, 0.2762]
-        )
-        train_set_loader, val_loader, test_loader = cifar100_dataloaders_no_val(
-            batch_size=args.batch_size, data_dir=args.data, num_workers=args.workers
-        )
 
-    elif args.dataset == "cifar10_no_val":
-        classes = 10
-        args.num_classes = classes
-        normalization = NormalizeByChannelMeanStd(
-            mean=[0.4914, 0.4822, 0.4465], std=[0.2470, 0.2435, 0.2616]
-        )
-        train_set_loader, val_loader, test_loader = cifar10_dataloaders_no_val(
-            batch_size=args.batch_size, data_dir=args.data, num_workers=args.workers
-        )
+def pruning_model_structured_channel_wise(model, px):
+    print("Apply structured L1 Pruning Globally (all conv layers) channel wise")
+    # parameters_to_prune =[]
+    for name, m in model.named_modules():
+        if isinstance(m, nn.Conv2d):
+            prune.ln_structured(
+                m,
+                name="weight",
+                amount=px,
+                # Prune the second dimension, corresponding to the index of the input feature maps.
+                dim=1,
+                n=1,  # l1 loss
+            )
 
+
+def pruning_model_random(model, px):
+    print("Apply Unstructured Random Pruning Globally (all conv layers)")
+    parameters_to_prune = []
+    for name, m in model.named_modules():
+        if isinstance(m, nn.Conv2d):
+            parameters_to_prune.append((m, "weight"))
+
+    parameters_to_prune = tuple(parameters_to_prune)
+    prune.global_unstructured(
+        parameters_to_prune,
+        pruning_method=prune.RandomUnstructured,
+        amount=px,
+    )
+
+
+def prune_model_custom(model, mask_dict):
+    print("Pruning with custom mask (all conv layers)")
+    for name, m in model.named_modules():
+        if isinstance(m, nn.Conv2d):
+            mask_name = name + ".weight_mask"
+            if mask_name in mask_dict.keys():
+                prune.CustomFromMask.apply(
+                    m, "weight", mask=mask_dict[name + ".weight_mask"]
+                )
+            else:
+                print("Can not find [{}] in mask_dict".format(mask_name))
+
+
+def remove_prune(model):
+    print("Remove hooks for multiplying masks (all conv layers)")
+    for name, m in model.named_modules():
+        if isinstance(m, nn.Conv2d):
+            prune.remove(m, "weight")
+
+
+# Mask operation function
+def extract_mask(model_dict):
+    new_dict = {}
+    for key in model_dict.keys():
+        if "mask" in key:
+            new_dict[key] = copy.deepcopy(model_dict[key])
+
+    return new_dict
+
+
+def reverse_mask(mask_dict):
+    new_dict = {}
+    for key in mask_dict.keys():
+        new_dict[key] = 1 - mask_dict[key]
+
+    return new_dict
+
+
+# Mask statistic function
+
+
+def check_sparsity(model):
+    sum_list = 0
+    zero_sum = 0
+
+    for name, m in model.named_modules():
+        if isinstance(m, nn.Conv2d):
+            sum_list = sum_list + float(m.weight.nelement())
+            zero_sum = zero_sum + float(torch.sum(m.weight == 0))
+
+    if zero_sum:
+        remain_weight_ratie = 100 * (1 - zero_sum / sum_list)
+        print("* remain weight ratio = ", 100 * (1 - zero_sum / sum_list), "%")
     else:
-        raise ValueError("Dataset not supprot yet !")
-    # import pdb;pdb.set_trace()
+        print("no weight for calculating sparsity")
+        remain_weight_ratie = None
 
-    if args.imagenet_arch:
-        model = model_dict[args.arch](num_classes=classes, imagenet=True)
+    return remain_weight_ratie
+
+
+def count_sparsity(model):
+    zero_count = 0
+    total_count = 0
+
+    for module in model.modules():
+        if isinstance(module, (nn.Conv1d, nn.Conv2d, nn.Conv3d, nn.Linear)):
+            zero_count = zero_count + torch.sum(module.weight == 0)
+            total_count = total_count + module.weight.nelement()
+
+    sparsity = 100.0 * float(zero_count / total_count)
+
+    print("Sparsity in total:")
+    print(sparsity)
+
+    return zero_count
+
+
+def check_sparsity_dict(state_dict):
+    sum_list = 0
+    zero_sum = 0
+
+    for key in state_dict.keys():
+        if "mask" in key:
+            sum_list += float(state_dict[key].nelement())
+            zero_sum += float(torch.sum(state_dict[key] == 0))
+
+    if zero_sum:
+        remain_weight_ratie = 100 * (1 - zero_sum / sum_list)
+        print("* remain weight ratio = ", 100 * (1 - zero_sum / sum_list), "%")
     else:
-        model = model_dict[args.arch](num_classes=classes)
+        print("no weight for calculating sparsity")
+        remain_weight_ratie = None
 
-    model.normalize = normalization
-    return model, train_set_loader, val_loader, test_loader
-
-
-def setup_seed(seed):
-    print("setup random seed = {}".format(seed))
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.backends.cudnn.deterministic = True
+    return remain_weight_ratie
 
 
-class NormalizeByChannelMeanStd(torch.nn.Module):
-    def __init__(self, mean, std):
-        super(NormalizeByChannelMeanStd, self).__init__()
-        if not isinstance(mean, torch.Tensor):
-            mean = torch.tensor(mean)
-        if not isinstance(std, torch.Tensor):
-            std = torch.tensor(std)
-        self.register_buffer("mean", mean)
-        self.register_buffer("std", std)
-
-    def forward(self, tensor):
-        return self.normalize_fn(tensor, self.mean, self.std)
-
-    def extra_repr(self):
-        return "mean={}, std={}".format(self.mean, self.std)
-
-    def normalize_fn(self, tensor, mean, std):
-        """Differentiable version of torchvision.functional.normalize"""
-        # here we assume the color channel is in at dim=1
-        mean = mean[None, :, None, None]
-        std = std[None, :, None, None]
-        return tensor.sub(mean).div(std)
-
-
-def accuracy(output, target, topk=(1,)):
-    """Computes the precision@k for the specified values of k"""
-    maxk = max(topk)
-    batch_size = target.size(0)
-
-    _, pred = output.topk(maxk, 1, True, True)
-    pred = pred.t()
-    correct = pred.eq(target.view(1, -1).expand_as(pred))
-
-    res = []
-    for k in topk:
-        correct_k = correct[:k].view(-1).float().sum(0)
-        res.append(correct_k.mul_(100.0 / batch_size))
-    return res
+def fetch_data(dataloader, num_classes, samples_per_class):
+    datas = [[] for _ in range(num_classes)]
+    labels = [[] for _ in range(num_classes)]
+    mark = dict()
+    dataloader_iter = iter(dataloader)
+    while True:
+        inputs, targets = next(dataloader_iter)
+        for idx in range(inputs.shape[0]):
+            x, y = inputs[idx : idx + 1], targets[idx : idx + 1]
+            category = y.item()
+            if len(datas[category]) == samples_per_class:
+                mark[category] = True
+                continue
+            datas[category].append(x)
+            labels[category].append(y)
+        if len(mark) == num_classes:
+            break
+    X, y = torch.cat([torch.cat(_, 0) for _ in datas]), torch.cat(
+        [torch.cat(_) for _ in labels]
+    ).view(-1)
+    return X, y
 
 
-def run_commands(gpus, commands, call=False, dir="commands", shuffle=True, delay=0.5):
-    if len(commands) == 0:
-        return
-    if os.path.exists(dir):
-        shutil.rmtree(dir)
-    if shuffle:
-        random.shuffle(commands)
-        random.shuffle(gpus)
-    os.makedirs(dir, exist_ok=True)
-
-    fout = open("stop_{}.sh".format(dir), "w")
-    print("kill $(ps aux|grep 'bash " + dir + "'|awk '{print $2}')", file=fout)
-    fout.close()
-
-    n_gpu = len(gpus)
-    for i, gpu in enumerate(gpus):
-        i_commands = commands[i::n_gpu]
-        if len(i_commands) == 0:
-            continue
-        prefix = "CUDA_VISIBLE_DEVICES={} ".format(gpu)
-
-        sh_path = os.path.join(dir, "run{}.sh".format(i))
-        fout = open(sh_path, "w")
-        for com in i_commands:
-            print(prefix + com, file=fout)
-        fout.close()
-        if call:
-            os.system("bash {}&".format(sh_path))
-            time.sleep(delay)
+def mp_importance_score(model):
+    score_dict = {}
+    for m in model.modules():
+        if isinstance(m, (Conv2d,)):
+            score_dict[(m, "weight")] = m.weight.data.abs()
+    return score_dict
 
 
-def get_loader_from_dataset(dataset, batch_size, seed=1, shuffle=True):
-    return torch.utils.data.DataLoader(
-        dataset, batch_size=batch_size, num_workers=0, pin_memory=True, shuffle=shuffle
-    )
+def snip_importance_score(
+    model, dataloader, samples_per_class, loss_func=torch.nn.CrossEntropyLoss()
+):
+    score_dict = {}
+    model.zero_grad()
+    device = next(model.parameters()).device
+    x, y = fetch_data(dataloader, model.fc.out_features, samples_per_class)
+    x, y = x.to(device), y.to(device)
+    loss = loss_func(model(x), y)
+    loss.backward()
+    for m in model.modules():
+        if isinstance(m, (Conv2d,)):
+            score_dict[(m, "weight")] = m.weight.grad.data.abs()
+    model.zero_grad()
+    return score_dict
 
 
-def get_unlearn_loader(marked_loader, args):
-    forget_dataset = copy.deepcopy(marked_loader.dataset)
-    marked = forget_dataset.targets < 0
-    forget_dataset.data = forget_dataset.data[marked]
-    forget_dataset.targets = -forget_dataset.targets[marked] - 1
-    forget_loader = get_loader_from_dataset(
-        forget_dataset, batch_size=args.batch_size, seed=args.seed, shuffle=True
-    )
-    retain_dataset = copy.deepcopy(marked_loader.dataset)
-    marked = retain_dataset.targets >= 0
-    retain_dataset.data = retain_dataset.data[marked]
-    retain_dataset.targets = retain_dataset.targets[marked]
-    retain_loader = get_loader_from_dataset(
-        retain_dataset, batch_size=args.batch_size, seed=args.seed, shuffle=True
-    )
-    print("datasets length: ", len(forget_dataset), len(retain_dataset))
-    return forget_loader, retain_loader
+def grasp_importance_score(
+    model, dataloader, samples_per_class, loss_func=torch.nn.CrossEntropyLoss()
+):
+    score_dict = {}
+    model.zero_grad()
+    device = next(model.parameters()).device
+    x, y = fetch_data(dataloader, model.fc.out_features, samples_per_class)
+    x, y = x.to(device), y.to(device)
+    loss = loss_func(model(x) / 200, y)
+    gs = grad(loss, model.parameters(), create_graph=True)
+    model.zero_grad()
+    t = sum([(g * g.data).sum() for g in gs])
+    t.backward()
+
+    for m in model.modules():
+        if isinstance(m, (Conv2d,)):
+            score_dict[(m, "weight")] = -m.weight.data * m.weight.grad.data
+    model.zero_grad()
+    return score_dict
 
 
-def get_poisoned_loader(poison_loader, unpoison_loader, test_loader, poison_func, args):
-    poison_dataset = copy.deepcopy(poison_loader.dataset)
-    poison_test_dataset = copy.deepcopy(test_loader.dataset)
+def synflow_importance_score(
+    model,
+    dataloader,
+):
+    @torch.no_grad()
+    def linearize(model):
+        signs = {}
+        for name, param in model.state_dict().items():
+            signs[name] = torch.sign(param)
+            param.abs_()
+        return signs
 
-    poison_dataset.data, poison_dataset.targets = poison_func(
-        poison_dataset.data, poison_dataset.targets
-    )
-    poison_test_dataset.data, poison_test_dataset.targets = poison_func(
-        poison_test_dataset.data, poison_test_dataset.targets
-    )
+    @torch.no_grad()
+    def nonlinearize(model, signs):
+        # model.float()
+        for name, param in model.state_dict().items():
+            param.mul_(signs[name])
 
-    full_dataset = torch.utils.data.ConcatDataset(
-        [unpoison_loader.dataset, poison_dataset]
-    )
+    model.eval()  # Crucial! BatchNorm will break the conservation laws for synaptic saliency
+    model.zero_grad()
+    score_dict = {}
+    signs = linearize(model)
 
-    poisoned_loader = get_loader_from_dataset(
-        poison_dataset, batch_size=args.batch_size, seed=args.seed, shuffle=False
-    )
-    poisoned_full_loader = get_loader_from_dataset(
-        full_dataset, batch_size=args.batch_size, seed=args.seed, shuffle=True
-    )
-    poisoned_test_loader = get_loader_from_dataset(
-        poison_test_dataset, batch_size=args.batch_size, seed=args.seed, shuffle=False
-    )
+    (data, _) = next(iter(dataloader))
+    input_dim = list(data[0, :].shape)
+    input = torch.ones([1] + input_dim).to(next(model.parameters()).device)
+    output = model(input)
+    torch.sum(output).backward()
 
-    return poisoned_loader, unpoison_loader, poisoned_full_loader, poisoned_test_loader
+    for m in model.modules():
+        if isinstance(m, (Conv2d,)):
+            if hasattr(m, "weight_orig"):
+                score_dict[(m, "weight")] = (
+                    m.weight_orig.grad.data * m.weight.data
+                ).abs()
+            else:
+                score_dict[(m, "weight")] = (m.weight.grad.data * m.weight.data).abs()
+    model.zero_grad()
+    nonlinearize(model, signs)
+    return score_dict
+
+
+def global_prune_model(
+    model, ratio, method, dataloader=None, structured=False, sample_per_classes=25
+):
+    if method == "mp":
+        score_dict = mp_importance_score(model)
+    elif method == "snip":
+        score_dict = snip_importance_score(model, dataloader, sample_per_classes)
+    elif method == "grasp":
+        score_dict = grasp_importance_score(model, dataloader, sample_per_classes)
+    elif method == "synflow":
+        pass
+    else:
+        raise NotImplementedError(f"Pruning Method {method} not Implemented")
+
+    if method == "synflow":
+        iteration_number = (
+            100  # In SynFlow Paper, an iteration number of 100 performs well
+        )
+        each_ratio = 1 - (1 - ratio) ** (1 / iteration_number)
+        for _ in range(iteration_number):
+            score_dict = synflow_importance_score(model, dataloader)
+            if structured:
+                pass
+            else:
+                prune.global_unstructured(
+                    parameters=score_dict.keys(),
+                    pruning_method=prune.L1Unstructured,
+                    amount=each_ratio,
+                    importance_scores=score_dict,
+                )
+    else:
+        prune.global_unstructured(
+            parameters=score_dict.keys(),
+            pruning_method=prune.L1Unstructured,
+            amount=ratio,
+            importance_scores=score_dict,
+        )
